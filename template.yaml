@@ -56,11 +56,15 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
     Description: Windows image, as an SSM public parameter (resolved to Amazon's latest image at each stack update).
-  InstallAwsCli:
-    Type: String
-    AllowedValues: ['true', 'false']
-    Default: 'true'
-    Description: Install AWS CLI v2 at boot (signature-checked), e.g. for aws s3 sync of build caches.
+  FailureHoldMinutes:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 120
+    Description: >-
+      When the user data or bootstrap fails, keep the instance up this many minutes before it shuts
+      down, so you can connect with Session Manager and look around (logs are in C:\gh-runner).
+      0 = shut down right away.
 
 Resources:
   # ------------------------------------------------------------------ storage and secrets
@@ -181,37 +185,73 @@ Resources:
               Encrypted: true
               DeleteOnTermination: true
         # Sets the hard lifetime first (so even a failed bootstrap can't run up costs), writes the
-        # bootstrap's settings, fetches bootstrap.ps1 from S3 and runs it as a SYSTEM scheduled
+        # bootstrap's settings, makes sure AWS CLI v2 is present (installing it, signature-checked,
+        # if the image lacks it), fetches bootstrap.ps1 from S3 and runs it as a SYSTEM scheduled
         # task, so the job isn't bound by EC2Launch's handling of long user-data scripts.
+        # Progress and errors also go to the serial console: aws ec2 get-console-output shows them.
+        # No AWS PowerShell module is used; Windows images don't reliably include one.
         UserData:
           Fn::Base64: !Sub |
             <powershell>
             shutdown.exe /s /t ([int]'${MaxRunMinutes}' * 60) /c "gh-runner maximum lifetime"
             $ErrorActionPreference = 'Stop'
             $ProgressPreference = 'SilentlyContinue'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            function Write-Console([string]$Message) {
+                $line = 'gh-runner userdata: ' + $Message
+                Write-Host $line
+                try {
+                    $port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
+                    $port.Open(); $port.WriteLine($line); $port.Close()
+                } catch { }
+            }
+            $aws = 'C:\Program Files\Amazon\AWSCLIV2\aws.exe'
+            $logKey = 'logs/unknown-instance'
             try {
+                Write-Console 'started'
                 New-Item -ItemType Directory -Force -Path C:\gh-runner | Out-Null
                 Start-Transcript -Path C:\gh-runner\userdata.log -Append | Out-Null
+                $token = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '3600' }
+                $instanceId = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/instance-id' -Headers @{ 'X-aws-ec2-metadata-token' = $token }
+                $logKey = 'logs/' + $instanceId
                 @{
-                    region        = '${AWS::Region}'
-                    bucket        = '${RunnerBucket}'
-                    paramPrefix   = '/gh-runner/${AWS::StackName}/jit'
-                    idleMinutes   = ${IdleMinutes}
-                    installAwsCli = '${InstallAwsCli}' -eq 'true'
+                    region             = '${AWS::Region}'
+                    bucket             = '${RunnerBucket}'
+                    paramPrefix        = '/gh-runner/${AWS::StackName}/jit'
+                    idleMinutes        = [int]'${IdleMinutes}'
+                    failureHoldMinutes = [int]'${FailureHoldMinutes}'
                 } | ConvertTo-Json | Set-Content -Path C:\gh-runner\config.json -Encoding UTF8
-                Import-Module AWSPowerShell
-                Read-S3Object -BucketName '${RunnerBucket}' -Key bootstrap/bootstrap.ps1 -File C:\gh-runner\bootstrap.ps1 -Region '${AWS::Region}' | Out-Null
+                if (-not (Test-Path -LiteralPath $aws)) {
+                    Write-Console 'installing AWS CLI v2'
+                    $msi = 'C:\gh-runner\AWSCLIV2.msi'
+                    Invoke-WebRequest -Uri 'https://awscli.amazonaws.com/AWSCLIV2.msi' -OutFile $msi -UseBasicParsing
+                    $sig = Get-AuthenticodeSignature -LiteralPath $msi
+                    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Amazon') {
+                        throw ('AWS CLI installer signature: ' + $sig.Status + ' ' + $sig.SignerCertificate.Subject)
+                    }
+                    $p = Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait -PassThru
+                    if ($p.ExitCode -ne 0) { throw ('AWS CLI install failed: msiexec exit ' + $p.ExitCode) }
+                }
+                & $aws s3 cp 's3://${RunnerBucket}/bootstrap/bootstrap.ps1' C:\gh-runner\bootstrap.ps1 --region '${AWS::Region}' --only-show-errors
+                if ($LASTEXITCODE -ne 0) { throw ('aws s3 cp of bootstrap.ps1 failed: exit ' + $LASTEXITCODE) }
                 $action = New-ScheduledTaskAction -Execute powershell.exe -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\gh-runner\bootstrap.ps1'
                 $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
                 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
                 Register-ScheduledTask -TaskName gh-runner -Action $action -Principal $principal -Settings $settings -Force | Out-Null
                 Start-ScheduledTask -TaskName gh-runner
+                Write-Console 'bootstrap.ps1 started'
             } catch {
-                Write-Warning "gh-runner user data failed: $_"
-                shutdown.exe /a
-                shutdown.exe /s /t 60 /c "gh-runner user data failed"
-            } finally {
+                Write-Console ('FAILED: ' + $_)
                 Stop-Transcript | Out-Null
+                if (Test-Path -LiteralPath $aws) {
+                    & $aws s3 cp C:\gh-runner\userdata.log ('s3://${RunnerBucket}/' + $logKey + '/userdata.log') --region '${AWS::Region}' --only-show-errors
+                }
+                $hold = [int]'${FailureHoldMinutes}'
+                Write-Console ('shutting down in ' + $hold + ' min + 60 s (FailureHoldMinutes)')
+                shutdown.exe /a
+                shutdown.exe /s /t ($hold * 60 + 60) /c "gh-runner user data failed"
+            } finally {
+                try { Stop-Transcript | Out-Null } catch { }
             }
             </powershell>
 
