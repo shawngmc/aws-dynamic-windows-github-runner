@@ -18,7 +18,7 @@ import time
 
 import boto3
 
-from common import SYSTEM_LABELS, env_list, get_secret, github, log, runner_instances
+from common import env_list, get_secret, github, log, runner_instances
 
 INSTANCE_TYPE_RE = re.compile(r"^[a-z][a-z0-9-]*\.[a-z0-9]+$")
 
@@ -53,14 +53,14 @@ def plan_launch(payload, allowed_repos, runner_label, allowed_types, default_typ
         return None, f"more than one instance type requested: {requested}"
     instance_type = requested[0] if requested else default_type
 
-    # The runner gets the job's labels (minus the ones GitHub adds itself), so it matches this job.
-    custom = [l for l in labels if l.lower() not in SYSTEM_LABELS]
+    # The runner is registered with exactly the job's labels, so it matches this job. A JIT runner
+    # gets only the labels passed here: GitHub doesn't add self-hosted, the OS or the architecture.
     return {
         "repo": repo,
         "job_id": str(job.get("id")),
         "run_id": str(job.get("run_id")),
         "instance_type": instance_type,
-        "labels": custom,
+        "labels": list(labels),
     }, "launch"
 
 
