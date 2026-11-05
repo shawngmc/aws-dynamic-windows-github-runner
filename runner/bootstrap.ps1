@@ -76,7 +76,7 @@ try {
         Invoke-WebRequest -Uri $psAsset.browser_download_url -OutFile $psMsi -UseBasicParsing
         if ((Get-FileHash -LiteralPath $psMsi -Algorithm SHA256).Hash -ne $psSha) { throw "$($psAsset.name) doesn't match GitHub's SHA256" }
         $sig = Get-AuthenticodeSignature -LiteralPath $psMsi
-        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O="?Microsoft Corporation') {
             throw "PowerShell installer signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
         }
         $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $psMsi, '/qn', '/norestart',
