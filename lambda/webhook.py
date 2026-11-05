@@ -122,7 +122,11 @@ def launch(plan):
     runner_id = jit["runner"]["id"]
     param = f"{os.environ['PARAM_PREFIX']}/{name}"
     try:
-        ssm.put_parameter(Name=param, Value=jit["encoded_jit_config"], Type="SecureString", Overwrite=True)
+        # The JIT config is longer than the standard tier's 4 KB limit; Intelligent-Tiering uses the
+        # advanced tier (8 KB) when needed. It lives only minutes (the instance deletes it), so the
+        # advanced tier's $0.05/month, prorated, comes to a fraction of a cent per runner.
+        ssm.put_parameter(Name=param, Value=jit["encoded_jit_config"], Type="SecureString",
+                          Tier="Intelligent-Tiering", Overwrite=True)
         tags = [
             {"Key": "Name", "Value": name},
             {"Key": "gh-runner", "Value": name},
