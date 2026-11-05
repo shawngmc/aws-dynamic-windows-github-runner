@@ -1,0 +1,4 @@
+templates:
+  - template.yaml
+ignore_checks:
+  - W3002   # Code: lambda/ is packaged by deploy.sh (aws cloudformation package)
