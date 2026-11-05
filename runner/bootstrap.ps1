@@ -7,7 +7,8 @@
 .DESCRIPTION
     1. Reads its runner name from the instance tag gh-runner (instance metadata, IMDSv2).
     2. Formats any raw local NVMe disks as NTFS work drives.
-    3. Optionally installs AWS CLI v2 (Authenticode-checked: signed by Amazon).
+    3. Optionally installs AWS CLI v2 (Authenticode-checked: signed by Amazon) and PowerShell 7
+       (GitHub SHA256 and Microsoft signature checked), which workflows use for 'shell: pwsh'.
     4. Downloads the latest GitHub Actions runner, checked against the SHA256 digest GitHub publishes.
     5. Reads the one-time runner config from SSM (SecureString) and deletes it.
     6. Runs the runner. If no job starts within idleMinutes (the job was cancelled, or another
@@ -56,6 +57,28 @@ try {
         if ($p.ExitCode -ne 0) { throw "AWS CLI install failed: msiexec exit $($p.ExitCode)" }
         $env:Path += ';C:\Program Files\Amazon\AWSCLIV2'
         Write-Step 'AWS CLI v2 installed'
+    }
+
+    # 3b. PowerShell 7 (workflows' 'shell: pwsh'; Windows Server only has Windows PowerShell 5.1).
+    # On unless config.json says installPowerShell = false, so it needs no stack update.
+    if ($null -eq $cfg.installPowerShell -or $cfg.installPowerShell) {
+        $ps = Invoke-RestMethod -Uri 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest' -Headers @{ 'User-Agent' = 'aws-dynamic-github-runner' }
+        $psAsset = $ps.assets | Where-Object { $_.name -like 'PowerShell-*-win-x64.msi' } | Select-Object -First 1
+        if (-not $psAsset) { throw "No win-x64 MSI in PowerShell release $($ps.tag_name)" }
+        if ("$($psAsset.digest)" -notmatch '^sha256:([0-9a-fA-F]{64})$') { throw "No SHA256 digest published for $($psAsset.name)" }
+        $psSha = $Matches[1].ToUpperInvariant()
+        $psMsi = "C:\gh-runner\$($psAsset.name)"
+        Invoke-WebRequest -Uri $psAsset.browser_download_url -OutFile $psMsi -UseBasicParsing
+        if ((Get-FileHash -LiteralPath $psMsi -Algorithm SHA256).Hash -ne $psSha) { throw "$($psAsset.name) doesn't match GitHub's SHA256" }
+        $sig = Get-AuthenticodeSignature -LiteralPath $psMsi
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw "PowerShell installer signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+        }
+        $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', $psMsi, '/qn', '/norestart',
+            'ADD_PATH=1', 'USE_MU=0', 'ENABLE_MU=0', 'ENABLE_PSREMOTING=0', 'ADD_EXPLORER_CONTEXT_MENU_OPENPOWERSHELL=0'
+        if ($p.ExitCode -ne 0) { throw "PowerShell install failed: msiexec exit $($p.ExitCode)" }
+        $env:Path += ';C:\Program Files\PowerShell\7'
+        Write-Step "PowerShell $($ps.tag_name) installed"
     }
 
     # 4. GitHub Actions runner, verified against GitHub's published digest.
