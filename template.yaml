@@ -226,7 +226,7 @@ Resources:
                     $msi = 'C:\gh-runner\AWSCLIV2.msi'
                     Invoke-WebRequest -Uri 'https://awscli.amazonaws.com/AWSCLIV2.msi' -OutFile $msi -UseBasicParsing
                     $sig = Get-AuthenticodeSignature -LiteralPath $msi
-                    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Amazon') {
+                    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O="?Amazon Web Services, Inc\.') {
                         throw ('AWS CLI installer signature: ' + $sig.Status + ' ' + $sig.SignerCertificate.Subject)
                     }
                     $p = Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait -PassThru
