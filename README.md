@@ -8,8 +8,8 @@ GitHub ──workflow_job "queued"──▶ Lambda function URL (webhook)
                                    ├─ registers a one-time (JIT) runner for the job's labels
                                    ├─ stores its config in SSM Parameter Store (SecureString)
                                    └─ launches an instance from the launch template
-EC2 instance (Windows Server 2025) ── user data: lifetime timer, then bootstrap.ps1 as a SYSTEM task
-   ├─ formats local NVMe, installs AWS CLI v2 and the latest Actions runner (digest-checked)
+EC2 instance (Windows Server 2025) ── user data: lifetime timer, AWS CLI v2 if missing, then bootstrap.ps1 as a SYSTEM task
+   ├─ formats local NVMe, installs PowerShell 7 and the latest Actions runner (digest-checked)
    ├─ reads and deletes its JIT config, runs ONE job (gives up if none starts within IdleMinutes)
    └─ uploads its log to S3, shuts down → terminated
 Cleanup Lambda (every 15 min): overdue instances, stale JIT configs, orphaned runner registrations
@@ -25,7 +25,7 @@ jobs:
 ```
 
 - **The job runs as SYSTEM**, which has administrator rights.
-- **Installed at boot:** PowerShell 7 (`shell: pwsh` works) and AWS CLI v2. Git isn't installed; `actions/checkout` then downloads the repository through the GitHub API instead.
+- **Installed at boot:** PowerShell 7 (`shell: pwsh` works), and AWS CLI v2 if the image doesn't have it (signature-checked). No AWS PowerShell module is needed. Git isn't installed; `actions/checkout` then downloads the repository through the GitHub API instead.
 - **Local NVMe** (`d` instance types) is formatted as an extra NTFS drive. Use the biggest drive for work files.
 - **`RUNNER_CACHE_BUCKET`** and `AWS_REGION` are set for the job, and the instance can read and write `s3://$RUNNER_CACHE_BUCKET/cache/`. For example, to keep downloads between runs:
 
@@ -97,7 +97,7 @@ GitHub sends a `ping`, which should show a green tick under Recent Deliveries. A
 | `IdleMinutes` | `20` | Shut down if no job starts this long after the runner is up |
 | `RootVolumeSizeGiB` | `100` | `C:` size (gp3, encrypted) |
 | `WindowsAmi` | Windows Server 2025 Full Base (SSM public parameter) | Resolved to the latest image on each stack update |
-| `InstallAwsCli` | `true` | AWS CLI v2, signature-checked (signed by Amazon) |
+| `FailureHoldMinutes` | `0` | When the user data or bootstrap fails, keep the instance up this long, so you can connect with Session Manager. `0` shuts down at once. |
 
 ## Cost
 
@@ -136,7 +136,8 @@ Only changes to `template.yaml` (parameters, IAM, the launch template) need a st
 | Symptom | Where to look |
 |---|---|
 | Job stays queued, no instance | Repository → Settings → Webhooks → Recent Deliveries (response body), and CloudWatch log group `/aws/lambda/<stack>-webhook` |
-| Instance starts, job never runs | `s3://<RunnerBucket>/logs/<runner name>/bootstrap-*.log`. While it's up: Session Manager, then `C:\gh-runner\*.log` |
+| Instance starts, job never runs | `aws ec2 get-console-output --instance-id i-... --latest --output text`: both scripts write their progress and errors to the serial console, which EC2 keeps for a while after termination. Logs are in `s3://<RunnerBucket>/logs/<runner name>/bootstrap-*.log` (bootstrap) and `logs/<instance id>/userdata.log` (user data, on failure). |
+| Need to look around on a failing instance | Deploy with `FailureHoldMinutes=30`. A failed instance then stays up that long; connect with Session Manager and read `C:\gh-runner\*.log`. |
 | Leftover instance or runner registration | `/aws/lambda/<stack>-cleanup` logs (it runs every 15 minutes) |
 
 ## Limitations

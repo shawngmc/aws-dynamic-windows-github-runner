@@ -7,13 +7,16 @@
 .DESCRIPTION
     1. Reads its runner name from the instance tag gh-runner (instance metadata, IMDSv2).
     2. Formats any raw local NVMe disks as NTFS work drives.
-    3. Optionally installs AWS CLI v2 (Authenticode-checked: signed by Amazon) and PowerShell 7
-       (GitHub SHA256 and Microsoft signature checked), which workflows use for 'shell: pwsh'.
+    3. Installs PowerShell 7 (GitHub SHA256 and Microsoft signature checked), which workflows use
+       for 'shell: pwsh'. AWS CLI v2 is already there: the user data installs it if the image lacks
+       it. No AWS PowerShell module is used.
     4. Downloads the latest GitHub Actions runner, checked against the SHA256 digest GitHub publishes.
     5. Reads the one-time runner config from SSM (SecureString) and deletes it.
     6. Runs the runner. If no job starts within idleMinutes (the job was cancelled, or another
        runner took it), stops and shuts down instead of waiting for the hard lifetime.
-    7. Uploads this log to s3://<bucket>/logs/<runner name>/ and shuts down.
+    7. Uploads this log to s3://<bucket>/logs/<runner name>/ and shuts down. On a failure with
+       FailureHoldMinutes > 0, it waits that long first, for debugging with Session Manager.
+    Progress also goes to the serial console: aws ec2 get-console-output --instance-id ... --latest
 
     Settings come from C:\gh-runner\config.json, written by the user data. Edit this file and
     re-upload it with deploy.sh; no stack update is needed.
@@ -25,8 +28,24 @@ $log = 'C:\gh-runner\bootstrap.log'
 Start-Transcript -Path $log -Append | Out-Null
 $cfg = Get-Content -LiteralPath C:\gh-runner\config.json -Raw | ConvertFrom-Json
 $name = 'unknown'
+$failed = $false
+$aws = 'C:\Program Files\Amazon\AWSCLIV2\aws.exe'   # installed by the user data if the image lacks it
+$env:Path += ';C:\Program Files\Amazon\AWSCLIV2'
 
-function Write-Step([string]$Message) { Write-Host ('{0:HH:mm:ss} {1}' -f (Get-Date), $Message) }
+# Progress goes to the transcript and to the serial console (aws ec2 get-console-output).
+function Write-Step([string]$Message) {
+    $line = '{0:HH:mm:ss} {1}' -f (Get-Date), $Message
+    Write-Host $line
+    try {
+        $port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
+        $port.Open(); $port.WriteLine('gh-runner bootstrap: ' + $line); $port.Close()
+    } catch { }
+}
+
+function Invoke-Aws {
+    & $aws @args --region $cfg.region
+    if ($LASTEXITCODE -ne 0) { throw "aws $($args[0]) $($args[1]) failed: exit $LASTEXITCODE" }
+}
 
 try {
     # 1. Runner name from the instance's tags.
@@ -43,20 +62,6 @@ try {
             New-Partition -UseMaximumSize -AssignDriveLetter |
             Format-Volume -FileSystem NTFS -NewFileSystemLabel Work -Confirm:$false
         Write-Step ("Formatted disk {0} as {1}: ({2:N0} GB)" -f $disk.Number, $vol.DriveLetter, ($vol.Size / 1GB))
-    }
-
-    # 3. AWS CLI v2.
-    if ($cfg.installAwsCli) {
-        $msi = 'C:\gh-runner\AWSCLIV2.msi'
-        Invoke-WebRequest -Uri 'https://awscli.amazonaws.com/AWSCLIV2.msi' -OutFile $msi -UseBasicParsing
-        $sig = Get-AuthenticodeSignature -LiteralPath $msi
-        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Amazon') {
-            throw "AWS CLI installer signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
-        }
-        $p = Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait -PassThru
-        if ($p.ExitCode -ne 0) { throw "AWS CLI install failed: msiexec exit $($p.ExitCode)" }
-        $env:Path += ';C:\Program Files\Amazon\AWSCLIV2'
-        Write-Step 'AWS CLI v2 installed'
     }
 
     # 3b. PowerShell 7 (workflows' 'shell: pwsh'; Windows Server only has Windows PowerShell 5.1).
@@ -95,10 +100,10 @@ try {
     Write-Step "Runner $($release.tag_name) unpacked"
 
     # 5. One-time runner config.
-    Import-Module AWSPowerShell
     $param = "$($cfg.paramPrefix)/$name"
-    $jit = (Get-SSMParameter -Name $param -WithDecryption $true -Region $cfg.region).Value
-    Remove-SSMParameter -Name $param -Region $cfg.region -Force
+    $jit = (Invoke-Aws ssm get-parameter --name $param --with-decryption --query Parameter.Value --output text | Out-String).Trim()
+    if (-not $jit) { throw "Empty JIT config in $param" }
+    Invoke-Aws ssm delete-parameter --name $param | Out-Null
     Write-Step 'JIT config read (parameter deleted)'
 
     # Visible to the job: where it can keep caches.
@@ -125,15 +130,18 @@ try {
     }
     Write-Step "Runner finished (job started: $started)"
 } catch {
-    Write-Warning "Bootstrap failed: $_"
+    $failed = $true
+    Write-Step "FAILED: $_"
 } finally {
     # Nothing here may stop the shutdown below.
     $ErrorActionPreference = 'Continue'
     Stop-Transcript | Out-Null
-    try {
-        Write-S3Object -BucketName $cfg.bucket -Key "logs/$name/bootstrap-$(Get-Date -Format yyyyMMdd-HHmmss).log" `
-            -File $log -Region $cfg.region | Out-Null
-    } catch { }
-    shutdown.exe /a                                   # cancel the lifetime timer set by the user data
-    shutdown.exe /s /t 5 /f /c 'gh-runner done'       # ...and shut down now (the instance terminates)
+    & $aws s3 cp $log "s3://$($cfg.bucket)/logs/$name/bootstrap-$(Get-Date -Format yyyyMMdd-HHmmss).log" --region $cfg.region --only-show-errors
+    $delay = 5
+    if ($failed -and [int]$cfg.failureHoldMinutes -gt 0) {
+        $delay = [int]$cfg.failureHoldMinutes * 60
+        Write-Step "Holding $($cfg.failureHoldMinutes) min before shutdown (FailureHoldMinutes); connect with Session Manager"
+    }
+    shutdown.exe /a                                          # cancel the lifetime timer set by the user data
+    shutdown.exe /s /t $delay /f /c 'gh-runner done'         # ...and shut down (the instance terminates)
 }
