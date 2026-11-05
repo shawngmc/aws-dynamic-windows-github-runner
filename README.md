@@ -25,6 +25,7 @@ jobs:
 ```
 
 - **The job runs as SYSTEM**, which has administrator rights.
+- **Installed at boot:** PowerShell 7 (`shell: pwsh` works) and AWS CLI v2. Git isn't installed; `actions/checkout` then downloads the repository through the GitHub API instead.
 - **Local NVMe** (`d` instance types) is formatted as an extra NTFS drive. Use the biggest drive for work files.
 - **`RUNNER_CACHE_BUCKET`** and `AWS_REGION` are set for the job, and the instance can read and write `s3://$RUNNER_CACHE_BUCKET/cache/`. For example, to keep downloads between runs:
 
@@ -119,6 +120,16 @@ Lambda, Secrets Manager (two secrets, about $0.80/month) and the cleanup schedul
 - **Downloads:** the runner zip must match the SHA-256 GitHub publishes, and the AWS CLI installer must be validly signed by Amazon.
 - **Lifetime limits:** every instance has a hard lifetime set by its user data before anything else runs. The cleanup Lambda terminates any that outlive it.
 - **Rejected:** the function URL is public (GitHub can't sign AWS requests), so anything without the right signature is rejected.
+
+## Changing what runs at boot
+
+The launch template only holds a short user-data script. It sets the lifetime timer, writes `C:\gh-runner\config.json` and downloads **`runner/bootstrap.ps1` from S3 at every boot**. To change the bootstrap, edit `runner/bootstrap.ps1` and upload it again; no stack update is needed:
+
+```bash
+./deploy.sh        # no parameters: the stack is left as it is, and bootstrap.ps1 is re-uploaded
+```
+
+Only changes to `template.yaml` (parameters, IAM, the launch template) need a stack update.
 
 ## Troubleshooting
 
