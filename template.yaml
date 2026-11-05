@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Ephemeral Windows EC2 runners for GitHub Actions. A GitHub workflow_job webhook calls a Lambda
+  function URL; for each queued job whose labels ask for this runner, the Lambda registers a
+  one-time (JIT) runner and launches an instance that runs that single job and then terminates.
+  Uses no GitHub-hosted minutes. Deploy with deploy.sh (it packages the Lambda code).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the runner instances.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the runner instances. Needs outbound internet (public subnet with AssignPublicIp, or a NAT gateway).
+  AssignPublicIp:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Give instances a public IP (needed in a public subnet without NAT). They accept no inbound traffic either way.
+  AllowedRepositories:
+    Type: CommaDelimitedList
+    Description: owner/repo names allowed to launch runners, e.g. shawngmc/windows-offline-install-media-builder. Jobs from any other repository are ignored.
+  RunnerLabel:
+    Type: String
+    Default: aws-windows
+    Description: Label a job must request (runs-on) to get one of these runners.
+  AllowedInstanceTypes:
+    Type: CommaDelimitedList
+    Default: m6id.2xlarge,c6id.2xlarge,m6id.4xlarge,m6i.2xlarge
+    Description: Instance types a job may request by adding the type as a runs-on label. Types with a 'd' (m6id, c6id) have local NVMe, which the runner formats as a work drive.
+  DefaultInstanceType:
+    Type: String
+    Default: m6id.2xlarge
+    Description: Instance type when the job's labels name none. Should be in AllowedInstanceTypes.
+  MaxInstances:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Most runner instances at once. A job queued over the limit isn't launched (re-run it later).
+  MaxRunMinutes:
+    Type: Number
+    Default: 420
+    MinValue: 30
+    Description: Hard lifetime of an instance; it powers off (and terminates) after this, whatever it's doing.
+  IdleMinutes:
+    Type: Number
+    Default: 20
+    MinValue: 5
+    Description: If no job has started this long after the runner comes online (job cancelled, or taken by another runner), the instance shuts down.
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 100
+    MinValue: 50
+    Description: "Size of the C: drive (gp3). Builds can also use the local NVMe drive on 'd' instance types."
+  WindowsAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
+    Description: Windows image, as an SSM public parameter (resolved to Amazon's latest image at each stack update).
+  InstallAwsCli:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Install AWS CLI v2 at boot (signature-checked), e.g. for aws s3 sync of build caches.
+
+Resources:
+  # ------------------------------------------------------------------ storage and secrets
+
+  RunnerBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-cache
+            Prefix: cache/
+            Status: Enabled
+            ExpirationInDays: 120
+          - Id: expire-logs
+            Prefix: logs/
+            Status: Enabled
+            ExpirationInDays: 30
+
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: GitHub webhook secret (generated). Paste it into the repository webhook's Secret field.
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  GitHubTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: >-
+        Fine-grained GitHub personal access token with Administration read/write on the allowed
+        repositories (registers and removes runners). Replace the placeholder after deploying.
+      SecretString: REPLACE_WITH_GITHUB_TOKEN
+
+  # ------------------------------------------------------------------ runner instances
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: GitHub runners - no inbound, all outbound
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager, for debugging
+      Policies:
+        - PolicyName: runner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: JitConfig
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:DeleteParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gh-runner/${AWS::StackName}/jit/*
+              - Sid: BucketList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RunnerBucket.Arn
+              - Sid: BootstrapRead
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${RunnerBucket.Arn}/bootstrap/*
+              - Sid: CacheAndLogs
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub ${RunnerBucket.Arn}/cache/*
+                  - !Sub ${RunnerBucket.Arn}/logs/*
+
+  RunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref RunnerRole]
+
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WindowsAmi
+        InstanceType: !Ref DefaultInstanceType
+        IamInstanceProfile: { Arn: !GetAtt RunnerInstanceProfile.Arn }
+        InstanceInitiatedShutdownBehavior: terminate
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled          # the bootstrap reads its runner name from the gh-runner tag
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref SubnetId
+            Groups: [!Ref RunnerSecurityGroup]
+            AssociatePublicIpAddress: !Ref AssignPublicIp
+            DeleteOnTermination: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref RootVolumeSizeGiB
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        # Sets the hard lifetime first (so even a failed bootstrap can't run up costs), writes the
+        # bootstrap's settings, fetches bootstrap.ps1 from S3 and runs it as a SYSTEM scheduled
+        # task, so the job isn't bound by EC2Launch's handling of long user-data scripts.
+        UserData:
+          Fn::Base64: !Sub |
+            <powershell>
+            shutdown.exe /s /t ([int]'${MaxRunMinutes}' * 60) /c "gh-runner maximum lifetime"
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                New-Item -ItemType Directory -Force -Path C:\gh-runner | Out-Null
+                Start-Transcript -Path C:\gh-runner\userdata.log -Append | Out-Null
+                @{
+                    region        = '${AWS::Region}'
+                    bucket        = '${RunnerBucket}'
+                    paramPrefix   = '/gh-runner/${AWS::StackName}/jit'
+                    idleMinutes   = ${IdleMinutes}
+                    installAwsCli = '${InstallAwsCli}' -eq 'true'
+                } | ConvertTo-Json | Set-Content -Path C:\gh-runner\config.json -Encoding UTF8
+                Import-Module AWSPowerShell
+                Read-S3Object -BucketName '${RunnerBucket}' -Key bootstrap/bootstrap.ps1 -File C:\gh-runner\bootstrap.ps1 -Region '${AWS::Region}' | Out-Null
+                $action = New-ScheduledTaskAction -Execute powershell.exe -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\gh-runner\bootstrap.ps1'
+                $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+                Register-ScheduledTask -TaskName gh-runner -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                Start-ScheduledTask -TaskName gh-runner
+            } catch {
+                Write-Warning "gh-runner user data failed: $_"
+                shutdown.exe /a
+                shutdown.exe /s /t 60 /c "gh-runner user data failed"
+            } finally {
+                Stop-Transcript | Out-Null
+            }
+            </powershell>
+
+  # ------------------------------------------------------------------ webhook Lambda
+
+  WebhookFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: webhook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Secrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref WebhookSecret, !Ref GitHubTokenSecret]
+              - Sid: JitConfig
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:DeleteParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gh-runner/${AWS::StackName}/jit/*
+              - Sid: Describe
+                Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:DescribeLaunchTemplates, ec2:DescribeLaunchTemplateVersions]
+                Resource: '*'
+              - Sid: LaunchFromTemplateOnly
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${RunnerLaunchTemplate}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetId}
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}::image/*
+              - Sid: TagOnLaunch
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                Condition:
+                  StringEquals: { ec2:CreateAction: RunInstances }
+              - Sid: PassRunnerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt RunnerRole.Arn
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-webhook
+      RetentionInDays: 30
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WebhookLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-webhook
+      Description: GitHub workflow_job webhook -> one ephemeral EC2 runner per queued job
+      Runtime: python3.12
+      Handler: webhook.handler
+      Code: lambda/          # replaced with an S3 location by 'aws cloudformation package' (deploy.sh)
+      Role: !GetAtt WebhookFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALLOWED_REPOS: !Join [',', !Ref AllowedRepositories]
+          RUNNER_LABEL: !Ref RunnerLabel
+          ALLOWED_TYPES: !Join [',', !Ref AllowedInstanceTypes]
+          DEFAULT_TYPE: !Ref DefaultInstanceType
+          MAX_INSTANCES: !Ref MaxInstances
+          LAUNCH_TEMPLATE_ID: !Ref RunnerLaunchTemplate
+          PARAM_PREFIX: !Sub /gh-runner/${AWS::StackName}/jit
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecret
+          TOKEN_SECRET_ARN: !Ref GitHubTokenSecret
+          STACK_NAME: !Ref AWS::StackName
+
+  WebhookFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt WebhookFunction.Arn
+      AuthType: NONE        # GitHub can't sign AWS requests; every request is checked against the webhook secret instead
+
+  WebhookUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # Newer function URLs also need lambda:InvokeFunction for public callers. Requests that don't
+  # carry a valid GitHub signature for the webhook secret are rejected by the function.
+  WebhookInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+
+  # ------------------------------------------------------------------ cleanup Lambda
+
+  CleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Token
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GitHubTokenSecret
+              - Sid: Describe
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Sid: TerminateOwnRunnersOnly
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals: { 'aws:ResourceTag/gh-runner-stack': !Ref AWS::StackName }
+              - Sid: JitConfig
+                Effect: Allow
+                Action: [ssm:GetParametersByPath, ssm:DeleteParameter]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gh-runner/${AWS::StackName}/jit
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gh-runner/${AWS::StackName}/jit/*
+
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-cleanup
+      RetentionInDays: 30
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CleanupLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-cleanup
+      Description: Terminates overdue runner instances; removes stale JIT parameters and offline runner registrations
+      Runtime: python3.12
+      Handler: cleanup.handler
+      Code: lambda/
+      Role: !GetAtt CleanupFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALLOWED_REPOS: !Join [',', !Ref AllowedRepositories]
+          MAX_RUN_MINUTES: !Ref MaxRunMinutes
+          PARAM_PREFIX: !Sub /gh-runner/${AWS::StackName}/jit
+          TOKEN_SECRET_ARN: !Ref GitHubTokenSecret
+          STACK_NAME: !Ref AWS::StackName
+
+  CleanupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(15 minutes)
+      Targets:
+        - Id: cleanup
+          Arn: !GetAtt CleanupFunction.Arn
+
+  CleanupSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupSchedule.Arn
+
+Outputs:
+  WebhookUrl:
+    Description: Payload URL for the repository webhook (content type application/json, event "Workflow jobs").
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  WebhookSecretArn:
+    Description: Secret holding the generated webhook secret (copy it into the webhook's Secret field).
+    Value: !Ref WebhookSecret
+  GitHubTokenSecretArn:
+    Description: Secret to put the GitHub token in (replace the placeholder).
+    Value: !Ref GitHubTokenSecret
+  RunnerBucket:
+    Description: Bucket for the bootstrap script (bootstrap/), build caches (cache/) and instance logs (logs/). Jobs see it as RUNNER_CACHE_BUCKET.
+    Value: !Ref RunnerBucket
+  RunsOn:
+    Description: What a workflow job uses to get one of these runners.
+    Value: !Sub '[self-hosted, ${RunnerLabel}]  (add an allowed instance type label to choose the type)'
