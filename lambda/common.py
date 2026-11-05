@@ -10,8 +10,6 @@ import boto3
 GITHUB_API = "https://api.github.com"
 USER_AGENT = "aws-dynamic-github-runner"
 
-# Labels GitHub gives every self-hosted runner itself; they aren't passed as custom labels.
-SYSTEM_LABELS = {"self-hosted", "windows", "linux", "macos", "x64", "arm64", "x86", "arm"}
 
 _secret_cache = {}
 

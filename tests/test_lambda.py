@@ -51,7 +51,7 @@ class PlanTests(unittest.TestCase):
         p, reason = plan(payload(["self-hosted", "aws-windows"]))
         self.assertEqual(reason, "launch")
         self.assertEqual(p["instance_type"], "m6id.2xlarge")
-        self.assertEqual(p["labels"], ["aws-windows"])  # self-hosted is a system label
+        self.assertEqual(p["labels"], ["self-hosted", "aws-windows"])
         self.assertEqual(p["job_id"], "123")
 
     def test_requested_type(self):
@@ -86,9 +86,10 @@ class PlanTests(unittest.TestCase):
         p, _ = plan(payload(["aws-windows"], action="completed"))
         self.assertIsNone(p)
 
-    def test_system_labels_dropped(self):
+    def test_all_job_labels_kept(self):
+        # A JIT runner only gets the labels it's registered with, so self-hosted etc. must be passed.
         p, _ = plan(payload(["self-hosted", "Windows", "X64", "aws-windows"]))
-        self.assertEqual(p["labels"], ["aws-windows"])
+        self.assertEqual(p["labels"], ["self-hosted", "Windows", "X64", "aws-windows"])
 
 
 class CleanupTests(unittest.TestCase):
