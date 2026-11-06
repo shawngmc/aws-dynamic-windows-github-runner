@@ -268,7 +268,7 @@ Each layer assumes the ones above it have failed. None of them needs AWS Organiz
 | **L5 admission control** | Atomic DDB counters: global / trust class / profile / connection / repo / **actor** concurrency; per-day budget per scope; per-job size caps. | Big matrices, abuse, loops. |
 | **L6 circuit breaker** | Spend estimate past threshold, or reaper actions above N/day → `FLAG#global=paused` + SNS. **AWS Budgets action** as an independent backstop: it attaches a deny policy to the scheduler role, so launches stop even if the control plane is buggy. | Bug loops, abuse, mining. |
 | **L7 account boundary** | Recommended: a **dedicated standalone AWS account** (no Organizations needed). Optional module for Organizations users: SCP restricting regions/families/required tags. All platform roles carry an **IAM permissions boundary**, which works without Organizations. | Everything above failing at once. |
-| **Alerting** | SNS (email; webhook to Slack/ntfy/Discord) on: reaper actions, launch/claim failures, breaker trips, forge auth failures, token expiry warnings. | Reaper action means a bug or an attack; surface it. |
+| **Alerting** | SNS **email** (webhook channels later) on: reaper actions, launch/claim failures, breaker trips, forge auth failures, token expiry warnings. | Reaper action means a bug or an attack; surface it. |
 
 ---
 
@@ -311,7 +311,7 @@ What the class controls (defaults):
 
 | | trusted | untrusted |
 |---|---|---|
-| Profiles | any allowed for the repo | only profiles marked `untrusted_ok` (small Linux by default) |
+| Profiles | any allowed for the repo | only profiles marked `untrusted_ok` (small Linux by default). Windows only if the deployment toggle `untrusted.allow_windows` is on (default **off**) |
 | Network tier | `standard` | `restricted` (§7.5) |
 | Cache | read/write own repo prefix | **read-only**, own repo prefix |
 | Limits | profile limits | lifetime ≤ 60 min, size ≤ `m`, 1 concurrent per actor, small daily budget |
@@ -446,7 +446,7 @@ tests; it's the integration boundary between the control plane and every OS.
 | | Backend | Notes |
 |---|---|---|
 | **Windows Server 2025/2022** | EC2 | Current. Stock image by default; baked opt-in. |
-| **Linux x64/arm64** | EC2 | Ubuntu 24.04 / AL2023. Graviton is often cheaper per build. Native Docker. Boots in about 1 minute even on stock images. |
+| **Linux arm64 (default) / x64** | EC2 | Ubuntu 24.04 / AL2023. **Graviton is the default** (often cheaper per build); x64 is a high-priority follow-up and the fallback default if arm64 causes friction (e.g. tools without arm64 builds). Native Docker. Boots in about 1 minute even on stock images. |
 | **Linux + KVM/QEMU** | EC2 | Nested virtualization on supported virtual families (AWS announced C8i/M8i/R8i in Feb 2026 and more Intel platforms in June 2026; KVM and Hyper-V) or `.metal`. The profile validator enforces this. |
 | **Windows + Hyper-V/WSL2** | EC2 | Same nested-virt families. |
 | **Linux light** | Fargate | Fast start, per-second billing. No privileged mode → no Docker daemon, no KVM; ≤16 vCPU/120 GiB. For lint/test/scripting jobs. |
@@ -509,20 +509,50 @@ secret, so one leaked secret affects one connection and can be rotated alone.
 
 ### 10.2 GitHub: personal accounts and orgs, dynamic
 
-- Use a **GitHub App** (permissions: Actions read, Administration read/write on repos, Metadata; for
-  org-level runners, Self-hosted runners read/write on orgs). Subscribe it to `workflow_job` and
-  `installation*` events. **One App = one webhook URL and secret for every account it's installed on.**
-- **Runners are registered at the repo level by default** via JIT. That works the same for
-  personal accounts (which have no runner groups) and orgs. For orgs, an option registers JIT
-  runners at the org level in a **dedicated runner group** restricted to selected repos.
-  Either way allocation is dynamic, one runner per queued job.
-- **App visibility:**
-  - *Private App per owner*: simplest and safest. A private App can only be installed on the account
-    that owns it, so you'd create one App for your personal account and one per org, i.e. one connection each.
-  - *One public App*: one App for everything, but anyone can install it. The scope allowlist then
-    becomes mandatory: installations from owners not on it are ignored and alerted on, and nothing launches.
-  - Both are supported by the same connection model. The default docs use the private-App-per-owner pattern.
-- Repo selection on the App installation is the first allowlist; the platform's scope allowlist is the second.
+Use **GitHub Apps**, not PATs: tokens are short-lived (1 h) per installation, aren't tied to a
+person, and their rate limits are per installation. An App has exactly **one webhook URL and one
+secret**, and receives events for every account it's installed on.
+
+**Where runners are registered (decided):**
+
+| Owner type | Registration | App permission needed | Why |
+|---|---|---|---|
+| **Organization** | Org-level JIT into a **dedicated runner group** restricted to selected repos (and optionally workflows) | Org: *Self-hosted runners: read/write* | Much narrower than repo *Administration*; runner groups add a GitHub-side allowlist. |
+| **Personal account** | Repo-level JIT (personal accounts have no org-level runners or runner groups) | Repo: *Administration: read/write* | The only option. It's a broad permission (repo settings and other admin operations), which is one more reason to keep each App's blast radius small. |
+
+Both also need Repo *Actions: read* (run details, queued jobs for the reconciler) and *Metadata: read*.
+Allocation is dynamic in both cases: one JIT runner per queued job.
+
+**App visibility (decided: private App per owner by default; public App as an advanced option):**
+
+| | **Private App per owner** (default) | **One public App + allowlist** (advanced) |
+|---|---|---|
+| Who can install | Only the account that owns the App. So one App for your user, and one *owned by each org* | Anyone on GitHub |
+| Apps to manage | N (one per owner) | 1 |
+| Blast radius of a leaked App key | That owner's repos only | **Every** installation |
+| Strangers | Can't install it | Can install it. You receive their webhooks, and the owner allowlist is the only thing stopping free compute for them. A bug in that check becomes an incident. |
+| Org politics | An org owns and controls its App, which its admins approve and can revoke. Works for orgs you don't own (an employer, a community org). | An org must grant *your* App permissions on its repos, which many org admins won't accept. |
+| Routing to deployments | Each owner's App can point at a different deployment (e.g. a separate public-repo account) | One webhook URL, so all installations go to one deployment (or ingest must forward) |
+| Key rotation | Per App, independent | Once, but affects everyone |
+| Permission changes | Each owner approves their own | Each installation must approve |
+
+To reduce the per-owner overhead:
+
+- **Automate App creation with GitHub's App manifest flow.** `runnerctl github add-owner <org>`, or a
+  dashboard button, opens a pre-filled "create App" page for that owner with the right permissions,
+  events and webhook URL. GitHub redirects back with a one-time code, which the platform exchanges
+  for the App ID, private key and webhook secret, storing them straight into SSM. Each owner is
+  one click by someone with admin rights on that owner, with nothing to copy and paste.
+- Each App becomes one **connection**. The dashboard shows them side by side.
+
+If the public-App option is enabled:
+
+- Installations from owners not on the allowlist are **uninstalled automatically**
+  (`DELETE /app/installations/{id}`) and alerted on.
+- Their webhooks are dropped at ingest, before any API call.
+
+Repo selection on each installation is the first allowlist; the platform's scope allowlist is the
+second, and the runner group (orgs) is the third.
 
 ### 10.3 Other forges
 
@@ -639,18 +669,21 @@ Each phase leaves a working system. The security contract (claim + supervisor) i
 a second OS is written against it, and public repos aren't enabled until trust classification exists.
 
 ### Phase 0 — New repo and foundations
-- [ ] New repo; copy the PoC as `legacy/` for reference; licence; CI (ruff, pytest, `tofu fmt/validate`, tflint, Go build/test).
+- [ ] New repo (no licence yet, D13); copy the PoC as `legacy/` for reference; CI (ruff, pytest, `tofu fmt/validate`, tflint, Go build/test).
 - [ ] ADRs: 0001 OpenTofu, 0002 Go supervisor, 0003 near-zero idle cost (§3) as a hard constraint, 0004 credential-less runners, 0005 per-job trust classification.
 - [ ] `THREAT-MODEL.md`, `COST.md` (idle budget table + CI cost check).
 - [ ] **If the PoC stays in use meanwhile:** move secrets to SSM, scope the JIT read (or pass it in user data), per-repo cache prefixes, logs write-only, and **don't connect public repos to it**.
 
 ### Phase 1 — Stateful control plane (Linux + GitHub + EC2, private repos)
 Linux first: it boots in about a minute, which makes iteration fast; Windows follows in Phase 3.
+First deployment in **us-east-1**; Linux on **arm64 (Graviton)** first, **x64 immediately after**
+(both are just profile entries and AMI lookups, and the Go supervisor cross-compiles), with x64
+promoted to default if arm64 slows things down.
 - [ ] OpenTofu modules: network (no NAT), control plane, compute-ec2.
 - [ ] DynamoDB; lease state machine; ingest → SQS → scheduler; delivery dedupe; atomic quotas; requeue.
 - [ ] Reconciler (adaptive cadence); lifecycle watcher; fast terminate on `completed`.
 - [ ] Per-lease Scheduler deadline; reaper; inventory sweep; SNS alerting; kill switch; Budgets action.
-- [ ] GitHub App connection model (private App per owner; personal + org; repo-level JIT).
+- [ ] GitHub App connection model: private App per owner created via the manifest flow; org-level JIT in a runner group for orgs, repo-level JIT for personal accounts.
 - [ ] Forge/Compute/platform interfaces with the GitHub/EC2/AWS implementations.
 
 ### Phase 2 — Security contract
@@ -694,15 +727,17 @@ Linux first: it boots in about a minute, which makes iteration fast; Windows fol
 | D2 | In-guest supervisor: **Go** single binary | Decided |
 | D3 | **Near-zero idle cost** is a hard constraint alongside security; no NAT, warm pools, paid firewalls, or always-on instances by default; paid features are opt-in modules | Decided |
 | D4 | **Public/forkable and private repos** are both in scope → per-job trust classification, untrusted tier | Decided |
-| D5 | GitHub **personal accounts and orgs**, runners allocated dynamically per job (repo-level JIT by default; org runner groups optional) | Decided |
+| D5 | GitHub **personal accounts and orgs**, runners allocated dynamically per job (see D9 for where they register) | Decided |
 | D6 | **AWS Organizations not required**; standalone accounts + permissions boundaries + Budgets; SCPs as an optional module | Decided |
 | D7 | Dashboard **multi-user from the start**: in-app OIDC, roles, per-connection grants, audit | Decided |
 | D8 | **Build**, borrowing ideas from [github-aws-runners/terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) and others | Decided |
 
+| D9 | GitHub: **private App per owner** by default, created through the manifest flow; public App + allowlist (with auto-uninstall) as an advanced option. Orgs register runners at the **org level in a runner group**; personal accounts at the repo level | Decided |
+| D10 | **Untrusted jobs on Windows: a per-deployment toggle, default off** (`untrusted.allow_windows = false`) | Decided |
+| D11 | **Alerts: email only** (SNS email subscription) for now; the alert sender has a channel interface for webhooks later | Decided |
+| D12 | **Region: us-east-1** for the first deployment. **Linux default arch: arm64 (Graviton)**, with **x64 as a high-priority follow-up**; if Graviton causes friction or slows progress, x64 becomes the default. Windows is x64 only (EC2 has no Windows on Graviton) | Decided |
+| D13 | **No licence** for now; to be decided before the repo is made public or accepts contributions | Decided |
+
 Still open (not blocking Phase 0–1):
 
-- **GitHub App pattern default:** private App per owner (current recommendation) or one public App with an allowlist.
-- **Untrusted defaults:** should untrusted jobs be Linux-only, or is a small Windows profile acceptable for public repos?
-- **Alert channel:** email via SNS only, or a webhook target (Slack/Discord/ntfy) in v1?
-- **Region(s)** for the first deployment, and whether Graviton should be the default Linux arch.
-- **New repo name / licence.**
+- **New repo name** (candidates discussed in chat).
