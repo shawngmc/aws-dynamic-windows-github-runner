@@ -1,4 +1,6 @@
-# Ephemeral Runner Platform — Design & Roadmap
+# hit-and-runner — Design & Roadmap
+
+*Ephemeral CI runners: in for one job, gone before anyone notices the bill.*
 
 Status: **draft, decisions round 1 applied** (see §16). This document takes the working proof of
 concept in this repository (Windows EC2 + GitHub + webhook Lambda) and lays out a design that can
@@ -538,7 +540,7 @@ Allocation is dynamic in both cases: one JIT runner per queued job.
 
 To reduce the per-owner overhead:
 
-- **Automate App creation with GitHub's App manifest flow.** `runnerctl github add-owner <org>`, or a
+- **Automate App creation with GitHub's App manifest flow.** `har github add-owner <org>`, or a
   dashboard button, opens a pre-filled "create App" page for that owner with the right permissions,
   events and webhook URL. GitHub redirects back with a one-time code, which the platform exchanges
   for the App ID, private key and webhook secret, storing them straight into SSM. Each owner is
@@ -737,7 +739,8 @@ promoted to default if arm64 slows things down.
 | D11 | **Alerts: email only** (SNS email subscription) for now; the alert sender has a channel interface for webhooks later | Decided |
 | D12 | **Region: us-east-1** for the first deployment. **Linux default arch: arm64 (Graviton)**, with **x64 as a high-priority follow-up**; if Graviton causes friction or slows progress, x64 becomes the default. Windows is x64 only (EC2 has no Windows on Graviton) | Decided |
 | D13 | **No licence** for now; to be decided before the repo is made public or accepts contributions | Decided |
+| D14 | Project name **hit-and-runner** (repo, Go module, docs). CLI binary **`har`**, also shipped as `hitandrun` as a stable long name for scripts and search. (`har` overlaps with the HTTP Archive file format in searches and on PyPI/npm; we don't publish packages under that name.) | Decided |
 
-Still open (not blocking Phase 0–1):
+Still open:
 
-- **New repo name** (candidates discussed in chat).
+- None.
